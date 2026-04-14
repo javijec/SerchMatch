@@ -82,8 +82,9 @@ def detect_pattern_columns(dataframe: pd.DataFrame) -> tuple[str | int, str | in
             intensity_col = col
 
     numeric_df = dataframe.apply(pd.to_numeric, errors="coerce")
+    minimum_numeric_rows = max(2, min(5, len(numeric_df)))
     usable_columns = [
-        col for col in numeric_df.columns if numeric_df[col].notna().sum() >= max(5, len(numeric_df) // 3)
+        col for col in numeric_df.columns if numeric_df[col].notna().sum() >= minimum_numeric_rows
     ]
     if len(usable_columns) < 2:
         raise ValueError("Se necesitan al menos dos columnas numéricas para 2theta e intensidad.")

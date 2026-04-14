@@ -1,10 +1,9 @@
-"""Streamlit UI for PXRD/XRD search & match."""
+"""Streamlit UI for indexed PXRD/XRD search & match."""
 
 from __future__ import annotations
 
 import json
 import sys
-from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -15,23 +14,30 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.models import MatchingParams, PeakDetectionParams, PreprocessingParams, SimulationParams
-from services.workflow import run_analysis, serialize_match_results
+from core.models import LibraryBuildConfig, PeakDetectionParams, PreprocessingParams, SearchConfig, SimulationParams
+from core.simulation import library_entry_to_stick_pattern
+from services.indexing import get_library_stats, rebuild_local_library, sync_cod_library_incremental
+from services.system_tools import get_command_status, install_svn_with_winget
+from services.workflow import matched_peaks_to_dataframe, multiphase_to_json_rows, run_analysis, serialize_match_results
 
 
-st.set_page_config(page_title="XRD Search & Match", layout="wide")
+DEFAULT_LIBRARY_PATH = PROJECT_ROOT / "data" / "reference_library.sqlite"
+DEFAULT_CIF_FOLDER = PROJECT_ROOT / "data" / "cif_library"
+DEFAULT_COD_MIRROR = PROJECT_ROOT / "data" / "cod_mirror"
+
+st.set_page_config(page_title="PXRD Search & Match", layout="wide")
 
 
 def pattern_figure(two_theta: pd.Series, intensity: pd.Series, title: str) -> go.Figure:
-    """Create a line figure for a diffraction pattern."""
+    """Create base experimental pattern figure."""
     figure = go.Figure()
     figure.add_trace(
         go.Scatter(
             x=two_theta,
             y=intensity,
             mode="lines",
-            name=title,
-            line={"width": 2},
+            name="Experimental",
+            line={"width": 2, "color": "#1f4e79"},
         )
     )
     figure.update_layout(
@@ -39,242 +45,380 @@ def pattern_figure(two_theta: pd.Series, intensity: pd.Series, title: str) -> go
         xaxis_title="2theta (deg)",
         yaxis_title="Intensidad relativa",
         template="plotly_white",
-        height=420,
+        height=440,
         margin={"l": 20, "r": 20, "t": 50, "b": 20},
-        legend={"orientation": "h"},
     )
     return figure
 
 
-def add_peak_markers(figure: go.Figure, peaks_df: pd.DataFrame) -> None:
-    """Add peak markers to the pattern figure."""
-    if peaks_df.empty:
+def add_fingerprint_markers(figure: go.Figure, fingerprint_df: pd.DataFrame) -> None:
+    """Overlay detected experimental peaks."""
+    if fingerprint_df.empty:
         return
     figure.add_trace(
         go.Scatter(
-            x=peaks_df["two_theta"],
-            y=peaks_df["intensity"],
+            x=fingerprint_df["two_theta"],
+            y=fingerprint_df["intensity"],
             mode="markers",
-            name="Picos detectados",
-            marker={"size": 8, "color": "#c43c39", "symbol": "x"},
+            name="Picos experimentales",
+            marker={"size": 8, "color": "#c43c39", "symbol": "diamond"},
         )
     )
 
 
-def overlay_candidates_figure(experimental_df: pd.DataFrame, selected_results) -> go.Figure:
-    """Create an overlay chart for the experimental pattern and selected candidates."""
-    figure = go.Figure()
+def overlay_match_figure(processed_df: pd.DataFrame, candidate) -> go.Figure:
+    """Overlay experimental profile with theoretical stick pattern."""
+    figure = pattern_figure(processed_df["two_theta"], processed_df["intensity"], "Overlay experimental vs. referencia")
+    theoretical_df = library_entry_to_stick_pattern(candidate.entry)
     figure.add_trace(
-        go.Scatter(
-            x=experimental_df["two_theta"],
-            y=experimental_df["intensity"],
-            mode="lines",
-            name="Experimental",
-            line={"width": 2, "color": "#1f4e79"},
+        go.Bar(
+            x=theoretical_df["two_theta"],
+            y=theoretical_df["intensity"],
+            name=f"Teórico: {candidate.entry.filename}",
+            marker_color="#3d8361",
+            opacity=0.35,
         )
     )
 
-    colors = ["#b85c38", "#3d8361", "#7b5ea7", "#586069", "#d97706"]
-    for idx, result in enumerate(selected_results):
-        candidate_df = result.simulated_pattern.pattern.to_dataframe()
+    explained_df = pd.DataFrame(
+        [
+            {
+                "two_theta": match.experimental_two_theta,
+                "intensity": match.experimental_intensity,
+            }
+            for match in candidate.matched_peaks
+        ]
+    )
+    unexplained_df = pd.DataFrame(
+        [
+            {
+                "two_theta": peak.two_theta,
+                "intensity": peak.intensity,
+            }
+            for peak in candidate.extra_experimental_peaks
+        ]
+    )
+    if not explained_df.empty:
         figure.add_trace(
-            go.Bar(
-                x=candidate_df["two_theta"],
-                y=candidate_df["intensity"],
-                name=result.phase_name,
-                marker_color=colors[idx % len(colors)],
-                opacity=0.45,
+            go.Scatter(
+                x=explained_df["two_theta"],
+                y=explained_df["intensity"],
+                mode="markers",
+                name="Picos explicados",
+                marker={"size": 9, "color": "#188038", "symbol": "circle"},
             )
         )
-
-    figure.update_layout(
-        title="Superposición experimental vs. candidatos",
-        xaxis_title="2theta (deg)",
-        yaxis_title="Intensidad relativa",
-        template="plotly_white",
-        height=520,
-        barmode="overlay",
-        margin={"l": 20, "r": 20, "t": 50, "b": 20},
-    )
+    if not unexplained_df.empty:
+        figure.add_trace(
+            go.Scatter(
+                x=unexplained_df["two_theta"],
+                y=unexplained_df["intensity"],
+                mode="markers",
+                name="Picos no explicados",
+                marker={"size": 9, "color": "#b3261e", "symbol": "x"},
+            )
+        )
+    figure.update_layout(barmode="overlay", height=520)
     return figure
 
 
+def _ensure_library_stats(path: Path):
+    """Return library stats, creating DB if missing."""
+    return get_library_stats(path)
+
+
 def main() -> None:
-    """Render the Streamlit application."""
+    """Render Streamlit application."""
     st.title("PXRD/XRD Search & Match")
-    st.caption("Análisis local de difracción de rayos X por polvo con comparación frente a patrones generados desde CIF.")
+    st.caption("Motor peak-based indexado con biblioteca local precomputada, pensado para crecer hacia una herramienta abierta y mantenible.")
+
+    library_db_path = Path(st.session_state.get("library_db_path", str(DEFAULT_LIBRARY_PATH)))
+    library_stats = _ensure_library_stats(library_db_path)
 
     with st.sidebar:
-        st.header("Entradas")
+        st.header("Biblioteca local")
+        library_db_text = st.text_input("SQLite biblioteca", value=str(library_db_path))
+        cif_folder = st.text_input("Carpeta de CIFs", value=str(DEFAULT_CIF_FOLDER))
+        top_peaks_count = st.slider("Top picos por referencia", 5, 30, 12)
+        fingerprint_bin_size = st.slider("Bin fingerprint (deg)", 0.05, 0.5, 0.2, step=0.05)
+        parallel_workers = st.slider("Workers indexación", 1, 8, 1, step=1)
+        sim_two_theta_min = st.number_input("2theta min biblioteca", value=5.0, min_value=0.0, max_value=180.0)
+        sim_two_theta_max = st.number_input("2theta max biblioteca", value=90.0, min_value=1.0, max_value=180.0)
+        wavelength = st.selectbox("Radiación", ["CuKa", "CuKa1", "MoKa", "CrKa", "FeKa"], index=0)
+        include_elements_text = st.text_input("Incluir elementos", value="", help="Prefiltro químico antes de indexar. Ej: Na, Cl")
+        exclude_elements_text = st.text_input("Excluir elementos", value="", help="Excluir CIFs que contengan estos elementos.")
+
+        library_config = LibraryBuildConfig(
+            top_peaks_count=top_peaks_count,
+            fingerprint_bin_size=fingerprint_bin_size,
+            parallel_workers=parallel_workers,
+            include_elements=[value.strip() for value in include_elements_text.split(",") if value.strip()] or None,
+            exclude_elements=[value.strip() for value in exclude_elements_text.split(",") if value.strip()] or None,
+            simulation=SimulationParams(
+                wavelength=wavelength,
+                two_theta_min=sim_two_theta_min,
+                two_theta_max=sim_two_theta_max,
+                scaled=True,
+                min_relative_intensity=0.5,
+            ),
+        )
+
+        if st.button("Reconstruir biblioteca", use_container_width=True):
+            try:
+                stats = rebuild_local_library(cif_folder, library_db_text, library_config)
+                st.session_state["library_db_path"] = str(library_db_text)
+                st.success(f"Biblioteca reconstruida: {stats.entry_count} entradas, {stats.peak_count} picos.")
+                library_stats = stats
+                library_db_path = Path(library_db_text)
+            except Exception as exc:
+                st.error(f"No se pudo reconstruir biblioteca: {exc}")
+
+        st.subheader("Sync incremental COD")
+        svn_status = get_command_status("svn")
+        status_text = svn_status.version or svn_status.message
+        st.caption(f"SVN: {'disponible' if svn_status.available else 'no disponible'} | {status_text}")
+        svn_install_col, svn_verify_col = st.columns(2)
+        with svn_install_col:
+            if st.button("Instalar SVN", use_container_width=True):
+                try:
+                    status = install_svn_with_winget()
+                    if status.available:
+                        st.success(f"SVN instalado: {status.version or status.path}")
+                    else:
+                        st.info(status.message)
+                except Exception as exc:
+                    st.error(f"No se pudo instalar SVN: {exc}")
+        with svn_verify_col:
+            if st.button("Verificar SVN", use_container_width=True):
+                status = get_command_status("svn")
+                if status.available:
+                    st.success(f"SVN OK: {status.version or status.path}")
+                else:
+                    st.warning(status.message)
+        cod_root = st.text_input("Mirror local COD", value=str(DEFAULT_COD_MIRROR))
+        cod_method = st.selectbox("Método sync COD", options=["svn", "rsync"], index=0)
+        perform_remote_sync = st.checkbox(
+            "Ejecutar sync remoto",
+            value=False,
+            help="Activá esto si ya tenés `svn` o `rsync` instalado. Si no, usa solo scan incremental sobre un mirror local ya descargado.",
+        )
+        if st.button("Sync COD incremental", use_container_width=True):
+            try:
+                report = sync_cod_library_incremental(
+                    sync_root=cod_root,
+                    database_path=library_db_text,
+                    config=library_config,
+                    method=cod_method,
+                    perform_remote_sync=perform_remote_sync,
+                )
+                st.session_state["library_db_path"] = str(library_db_text)
+                library_stats = report.library_stats
+                st.success(
+                    "COD sync listo. "
+                    f"+{report.added_count} nuevos, ~{report.modified_count} modificados, "
+                    f"-{report.deleted_count} borrados, {report.filtered_out_count} filtrados, "
+                    f"{report.reindexed_count} reindexados."
+                )
+            except Exception as exc:
+                st.error(f"No se pudo sincronizar COD: {exc}")
+
+        st.caption(
+            f"Entradas indexadas: {library_stats.entry_count} | picos almacenados: {library_stats.peak_count}"
+        )
+
+        st.header("Patrón experimental")
         experimental_file = st.file_uploader(
             "Difractograma experimental",
             type=["xy", "txt", "csv"],
-            help="Archivos de dos columnas con 2theta e intensidad.",
-        )
-        cif_files = st.file_uploader(
-            "Archivos CIF",
-            type=["cif"],
-            accept_multiple_files=True,
-            help="Cargá uno o más CIFs para generar patrones teóricos candidatos.",
+            help="Archivo experimental con columnas 2theta e intensidad.",
         )
 
         st.header("Preprocesamiento")
         preprocessing_params = PreprocessingParams(
             normalize=st.checkbox("Normalizar intensidad", value=True),
             smoothing_enabled=st.checkbox("Suavizado Savitzky-Golay", value=False),
-            smoothing_window=st.slider("Ventana de suavizado", 5, 41, 11, step=2),
+            smoothing_window=st.slider("Ventana suavizado", 5, 41, 11, step=2),
             smoothing_polyorder=st.slider("Orden polinomial", 2, 5, 3),
-            background_correction_enabled=st.checkbox("Corrección de fondo simple", value=False),
-            background_window=st.slider("Ventana de fondo", 11, 201, 51, step=2),
-            clip_negative=st.checkbox("Recortar intensidades negativas", value=True),
+            background_correction_enabled=st.checkbox("Corrección fondo", value=False),
+            background_window=st.slider("Ventana fondo", 11, 201, 51, step=2),
+            clip_negative=st.checkbox("Recortar negativos", value=True),
         )
 
-        st.header("Detección de picos")
+        st.header("Fingerprint experimental")
         raw_min_width = st.slider("Ancho mínimo", 0.0, 20.0, 0.0, step=0.5)
         peak_params = PeakDetectionParams(
             min_height=st.slider("Altura mínima", 0.0, 100.0, 5.0, step=0.5),
-            prominence=st.slider("Prominencia mínima", 0.0, 100.0, 3.0, step=0.5),
-            min_distance_points=st.slider("Distancia mínima (puntos)", 1, 50, 5),
+            prominence=st.slider("Prominencia", 0.0, 100.0, 3.0, step=0.5),
+            min_distance_points=st.slider("Distancia mínima (pts)", 1, 50, 5),
             min_width=raw_min_width if raw_min_width > 0 else None,
         )
 
-        st.header("Matching")
-        simulation_params = SimulationParams(
-            wavelength=st.selectbox("Radiación", ["CuKa", "CuKa1", "MoKa", "CrKa", "FeKa"], index=0),
-            two_theta_min=st.number_input("2theta mínimo", value=5.0, min_value=0.0, max_value=180.0),
-            two_theta_max=st.number_input("2theta máximo", value=90.0, min_value=1.0, max_value=180.0),
-            scaled=True,
+        st.header("Search & Match")
+        search_config = SearchConfig(
+            two_theta_tolerance=st.slider("Tolerancia 2theta", 0.02, 1.0, 0.20, step=0.01),
+            min_peak_matches=st.slider("Mínimo picos compatibles", 1, 8, 2),
+            top_n_prefilter=st.slider("Top N picos prefilter", 3, 20, 8),
+            max_candidates=st.slider("Máximo candidatos detallados", 5, 200, 50),
+            multifase_max_results=st.slider("Máx. combinaciones 2 fases", 1, 10, 5),
+            enable_multiphase=st.checkbox("Búsqueda multifase simple", value=True),
         )
-        matching_params = MatchingParams(
-            two_theta_tolerance=st.slider("Tolerancia 2theta", 0.01, 1.0, 0.20, step=0.01),
-            intensity_weight=st.slider("Peso intensidades", 0.0, 1.0, 0.35, step=0.05),
-            position_weight=st.slider("Peso posiciones", 0.0, 1.0, 0.45, step=0.05),
-            missing_peak_weight=st.slider("Peso penalización faltantes", 0.0, 1.0, 0.20, step=0.05),
-            min_theoretical_relative_intensity=st.slider("Intensidad teórica mínima (%)", 0.0, 50.0, 5.0, step=1.0),
-            top_n=st.slider("Top N candidatos", 1, 20, 10),
-        )
+        element_filter_text = st.text_input("Filtro opcional elementos", value="", help="Ej: Na, Cl")
+        if element_filter_text.strip():
+            search_config.element_filter = [value.strip() for value in element_filter_text.split(",") if value.strip()]
 
-        run_clicked = st.button("Ejecutar análisis", use_container_width=True, type="primary")
+        run_clicked = st.button("Ejecutar Search & Match", use_container_width=True, type="primary")
 
-    if not experimental_file or not cif_files:
-        st.info("Cargá un difractograma experimental y al menos un CIF para ejecutar el search & match.")
+    if not experimental_file:
+        st.info("Cargá un difractograma experimental. Si todavía no construiste biblioteca, usá la sección lateral.")
         st.markdown(
-            f"Ejemplos incluidos: `{PROJECT_ROOT / 'data' / 'examples' / 'sample_experimental.xy'}` y `{PROJECT_ROOT / 'data' / 'cif_library'}`"
+            f"Ejemplos incluidos: `{PROJECT_ROOT / 'data' / 'examples' / 'sample_experimental.xy'}` y carpeta `{DEFAULT_CIF_FOLDER}`"
         )
         return
 
+    if library_stats.entry_count == 0:
+        st.warning("Biblioteca local vacía. Reconstruí primero desde una carpeta de CIFs.")
+        return
+
     if not run_clicked and "analysis_artifacts" not in st.session_state:
-        st.warning("Presioná `Ejecutar análisis` para procesar el patrón con los parámetros actuales.")
+        st.warning("Presioná `Ejecutar Search & Match` para analizar con parámetros actuales.")
         return
 
     try:
         if run_clicked:
-            temp_cif_dir = PROJECT_ROOT / "data" / "_tmp_uploaded_cifs"
-            temp_cif_dir.mkdir(parents=True, exist_ok=True)
-            cif_paths: list[Path] = []
-            for cif_file in cif_files:
-                target_path = temp_cif_dir / cif_file.name
-                target_path.write_bytes(cif_file.getbuffer())
-                cif_paths.append(target_path)
-
             artifacts = run_analysis(
-                pattern_source=BytesIO(experimental_file.getvalue()),
-                cif_paths=cif_paths,
+                pattern_source=experimental_file,
+                database_path=library_db_text,
+                library_config=library_config,
                 preprocessing_params=preprocessing_params,
                 peak_params=peak_params,
-                simulation_params=simulation_params,
-                matching_params=matching_params,
+                search_config=search_config,
                 source_name=experimental_file.name,
             )
             st.session_state["analysis_artifacts"] = artifacts
-
+            st.session_state["library_db_path"] = library_db_text
         artifacts = st.session_state["analysis_artifacts"]
     except Exception as exc:
-        st.error(f"No se pudo completar el análisis: {exc}")
+        st.error(f"No se pudo completar search & match: {exc}")
         return
 
     processed_df = artifacts.experimental_processed.to_dataframe()
-    peaks_df = artifacts.detected_peaks.to_dataframe()
+    fingerprint_df = artifacts.experimental_fingerprint.to_dataframe()
+    ranking_df = pd.DataFrame(serialize_match_results(artifacts))
 
-    main_col, side_col = st.columns([1.7, 1.0])
-    with main_col:
-        figure = pattern_figure(
-            processed_df["two_theta"],
-            processed_df["intensity"],
-            title="Difractograma experimental procesado",
-        )
-        add_peak_markers(figure, peaks_df)
+    summary_col, summary_col_2, summary_col_3, summary_col_4 = st.columns(4)
+    with summary_col:
+        st.metric("Entradas indexadas", artifacts.library_stats.entry_count)
+    with summary_col_2:
+        st.metric("Picos experimentales", len(fingerprint_df))
+    with summary_col_3:
+        st.metric("Candidatos prefiltrados", artifacts.prefilter_candidate_count)
+    with summary_col_4:
+        best_score = artifacts.candidate_ranking[0].score if artifacts.candidate_ranking else 0.0
+        st.metric("Mejor score", f"{best_score:.1f}")
+
+    chart_col, peaks_col = st.columns([1.7, 1.0])
+    with chart_col:
+        figure = pattern_figure(processed_df["two_theta"], processed_df["intensity"], "Difractograma procesado")
+        add_fingerprint_markers(figure, fingerprint_df)
         st.plotly_chart(figure, use_container_width=True)
+    with peaks_col:
+        st.subheader("Top picos fingerprint")
+        top_df = pd.DataFrame(
+            [
+                {"two_theta": peak.two_theta, "intensity": peak.intensity}
+                for peak in artifacts.experimental_fingerprint.top_peaks
+            ]
+        )
+        st.dataframe(top_df, use_container_width=True, hide_index=True)
 
-    with side_col:
-        st.subheader("Resumen")
-        st.metric("Picos detectados", len(peaks_df))
-        if artifacts.candidate_results:
-            st.metric("Mejor score", f"{artifacts.candidate_results[0].score:.1f}")
-            st.metric("Mejor candidato", artifacts.candidate_results[0].phase_name)
+    st.subheader("Tabla de picos experimentales")
+    st.dataframe(fingerprint_df, use_container_width=True, hide_index=True)
 
-    st.subheader("Picos detectados")
-    st.dataframe(peaks_df, use_container_width=True, hide_index=True)
-
-    ranking_rows = serialize_match_results(artifacts)
-    ranking_df = pd.DataFrame(ranking_rows)
-    st.subheader("Ranking de fases candidatas")
+    st.subheader("Ranking de candidatos")
     st.dataframe(ranking_df, use_container_width=True, hide_index=True)
 
-    if not artifacts.candidate_results:
-        st.warning("No se encontraron candidatos para mostrar.")
+    if not artifacts.candidate_ranking:
+        st.warning("Prefiltro sin candidatos compatibles. Probá aumentar tolerancia o bajar restricciones.")
         return
 
-    phase_names = [result.phase_name for result in artifacts.candidate_results]
-    selected_phase_names = st.multiselect(
-        "Candidatos para superponer",
-        options=phase_names,
-        default=phase_names[: min(3, len(phase_names))],
-    )
-    selected_results = [result for result in artifacts.candidate_results if result.phase_name in selected_phase_names]
+    candidate_labels = [
+        f"{candidate.entry.filename} | {candidate.entry.formula or 'sin fórmula'} | {candidate.score:.1f}"
+        for candidate in artifacts.candidate_ranking
+    ]
+    selected_label = st.selectbox("Detalle de candidato", options=candidate_labels)
+    selected_index = candidate_labels.index(selected_label)
+    selected_candidate = artifacts.candidate_ranking[selected_index]
 
-    if selected_results:
-        st.plotly_chart(
-            overlay_candidates_figure(processed_df, selected_results),
-            use_container_width=True,
-        )
-
-    selected_detail_name = st.selectbox("Detalle de candidato", phase_names)
-    selected_detail = next(result for result in artifacts.candidate_results if result.phase_name == selected_detail_name)
+    st.plotly_chart(overlay_match_figure(processed_df, selected_candidate), use_container_width=True)
 
     detail_col_1, detail_col_2 = st.columns([1.0, 1.2])
     with detail_col_1:
-        st.subheader("Desglose del score")
+        st.subheader("Desglose score")
         st.json(
             {
-                "score_total": round(selected_detail.score, 3),
-                "matched_peak_fraction": round(selected_detail.breakdown.matched_peak_fraction, 3),
-                "position_score": round(selected_detail.breakdown.position_score, 3),
-                "intensity_score": round(selected_detail.breakdown.intensity_score, 3),
-                "missing_penalty": round(selected_detail.breakdown.missing_penalty, 3),
-                "matched_peak_count": selected_detail.breakdown.matched_peak_count,
-                "important_theoretical_peak_count": selected_detail.breakdown.important_theoretical_peak_count,
-                "cif_path": str(selected_detail.cif_path),
+                "score_total": round(selected_candidate.score, 3),
+                "source_id": selected_candidate.entry.source_id,
+                "formula": selected_candidate.entry.formula,
+                "crystal_system": selected_candidate.entry.crystal_system,
+                "spacegroup": selected_candidate.entry.spacegroup,
+                "position_score": round(selected_candidate.breakdown.position_score * 100.0, 2),
+                "intensity_score": round(selected_candidate.breakdown.intensity_score * 100.0, 2),
+                "matched_fraction": round(selected_candidate.breakdown.matched_fraction * 100.0, 2),
+                "missing_penalty": round(selected_candidate.breakdown.missing_penalty * 100.0, 2),
+                "extra_penalty": round(selected_candidate.breakdown.extra_penalty * 100.0, 2),
+                "matched_peak_count": selected_candidate.breakdown.matched_peak_count,
             }
         )
-
+        st.subheader("Picos faltantes teóricos")
+        missing_df = pd.DataFrame(
+            [{"two_theta": peak.two_theta, "intensity": peak.intensity} for peak in selected_candidate.missing_theoretical_peaks]
+        )
+        st.dataframe(missing_df, use_container_width=True, hide_index=True)
     with detail_col_2:
         st.subheader("Picos emparejados")
-        st.dataframe(pd.DataFrame(selected_detail.matched_peaks), use_container_width=True, hide_index=True)
+        st.dataframe(matched_peaks_to_dataframe(artifacts, selected_index), use_container_width=True, hide_index=True)
+        st.subheader("Picos experimentales no explicados")
+        extra_df = pd.DataFrame(
+            [{"two_theta": peak.two_theta, "intensity": peak.intensity} for peak in selected_candidate.extra_experimental_peaks]
+        )
+        st.dataframe(extra_df, use_container_width=True, hide_index=True)
 
-    export_col_1, export_col_2 = st.columns(2)
+    st.subheader("Búsqueda multifase simple")
+    multiphase_df = pd.DataFrame(
+        [
+            {
+                "phases": combination.label(),
+                "combined_score": round(combination.combined_score, 3),
+                "explained_fraction": round(combination.explained_fraction * 100.0, 2),
+            }
+            for combination in artifacts.multiphase_candidates
+        ]
+    )
+    if multiphase_df.empty:
+        st.info("Sin propuesta multifase adicional. Caso posiblemente monofásico o residual insuficiente.")
+    else:
+        st.dataframe(multiphase_df, use_container_width=True, hide_index=True)
+
+    export_col_1, export_col_2, export_col_3 = st.columns(3)
     with export_col_1:
         st.download_button(
             "Descargar ranking CSV",
             data=ranking_df.to_csv(index=False).encode("utf-8"),
-            file_name="xrd_search_match_results.csv",
+            file_name="xrd_search_match_ranking.csv",
             mime="text/csv",
         )
     with export_col_2:
         st.download_button(
             "Descargar ranking JSON",
-            data=json.dumps(ranking_rows, indent=2).encode("utf-8"),
-            file_name="xrd_search_match_results.json",
+            data=json.dumps(serialize_match_results(artifacts), indent=2).encode("utf-8"),
+            file_name="xrd_search_match_ranking.json",
+            mime="application/json",
+        )
+    with export_col_3:
+        st.download_button(
+            "Descargar multifase JSON",
+            data=multiphase_to_json_rows(artifacts),
+            file_name="xrd_search_match_multiphase.json",
             mime="application/json",
         )
 
